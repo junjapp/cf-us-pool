@@ -1,0 +1,2 @@
+count=20
+sample=LAX,LAX,LAX,LAX,LAX,LAX,LAX,LAX,LAX,LAX
