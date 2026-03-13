@@ -1,0 +1,103 @@
+name: Update US Cloudflare IPs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: update-us-cf-ips
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download CloudflareSpeedTest
+        run: |
+          curl -L -o cfst.tar.gz https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
+          tar -zxf cfst.tar.gz
+          chmod +x cfst
+
+      - name: Run CloudflareSpeedTest for US POPs
+        run: |
+          ./cfst \
+            -httping \
+            -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
+            -n 60 \
+            -t 4 \
+            -tp 443 \
+            -tl 250 \
+            -tlr 0.2 \
+            -dn 20 \
+            -dt 8 \
+            -sl 0.5 \
+            -p 0 \
+            -o result.csv
+
+      - name: Build us.txt for cfnew
+        run: |
+          python - <<'PY'
+          import csv
+          import pathlib
+          import sys
+
+          allowed = {
+              "LAX", "SJC", "SEA", "LAS", "PHX", "DEN",
+              "DFW", "ORD", "ATL", "IAD", "EWR", "JFK",
+              "BOS", "MIA"
+          }
+
+          rows = []
+          seen = set()
+
+          with open("result.csv", encoding="utf-8-sig") as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  ip = (row.get("IP 地址") or row.get("IP地址") or "").strip()
+                  colo = (row.get("地区码") or "").strip().upper()
+                  if not ip or not colo or colo not in allowed:
+                      continue
+                  if ip in seen:
+                      continue
+                  seen.add(ip)
+                  rows.append((ip, colo))
+
+          if len(rows) < 5:
+              print(f"Too few usable US IPs: {len(rows)}", file=sys.stderr)
+              sys.exit(1)
+
+          out = pathlib.Path("us.txt")
+          out.write_text(
+              "\n".join(
+                  f"{ip}:443#US-{colo}-{i:02d}"
+                  for i, (ip, colo) in enumerate(rows[:20], 1)
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          meta = pathlib.Path("us-meta.txt")
+          meta.write_text(
+              "\n".join([
+                  f"count={min(len(rows), 20)}",
+                  f"sample={','.join(colo for _, colo in rows[:10])}"
+              ]) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add us.txt us-meta.txt
+          git diff --cached --quiet && exit 0
+          git commit -m "update us.txt"
+          git push
