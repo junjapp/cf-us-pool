@@ -2,6 +2,12 @@ name: Update US Cloudflare IPs
 
 on:
   workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: "Manual debug run for CloudflareSpeedTest"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "17 */6 * * *"
 
@@ -15,85 +21,97 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CFST_VERSION: v2.3.4
-  CFST_URL: http://speed.cloudflare.com/__down?bytes=209715200
+  CFST_URL: https://speed.cloudflare.com/__down?bytes=99999999
+  FAILCOUNT_FILE: .github/state/update-us-cf-ips.failcount
+  MAX_CONSECUTIVE_FAILURES: "3"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Download CloudflareSpeedTest
+      - name: Read failure fuse
+        id: fuse
+        shell: bash
         run: |
           set -euo pipefail
+
+          mkdir -p "$(dirname "$FAILCOUNT_FILE")"
+          if [ ! -f "$FAILCOUNT_FILE" ]; then
+            echo 0 > "$FAILCOUNT_FILE"
+          fi
+
+          count="$(tr -d '[:space:]' < "$FAILCOUNT_FILE")"
+          if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+            count=0
+          fi
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$count" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Scheduled runs paused after $count consecutive failures. Use workflow_dispatch after fixing the config."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop scheduled runs after repeated failures
+        if: ${{ steps.fuse.outputs.skip == 'true' }}
+        run: |
+          echo "Skipping scheduled run because the consecutive failure threshold was reached."
+          exit 0
+
+      - name: Download CloudflareSpeedTest
+        if: ${{ steps.fuse.outputs.skip != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           curl -fL --retry 3 --retry-delay 2 \
             -o cfst.tar.gz \
             "https://github.com/XIU2/CloudflareSpeedTest/releases/download/${CFST_VERSION}/cfst_linux_amd64.tar.gz"
+
           tar -zxf cfst.tar.gz
           chmod +x cfst
 
       - name: Run CloudflareSpeedTest for US POPs
+        if: ${{ steps.fuse.outputs.skip != 'true' }}
+        shell: bash
         run: |
           set -euo pipefail
 
           RESULT_CSV="${GITHUB_WORKSPACE}/result.csv"
-          DEBUG_CSV="${GITHUB_WORKSPACE}/debug-result.csv"
+          rm -f "$RESULT_CSV"
 
-          rm -f "$RESULT_CSV" "$DEBUG_CSV"
-
-          ./cfst \
-            -httping \
-            -httping-code 200 \
-            -url "${CFST_URL}" \
-            -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
-            -n 20 \
-            -t 4 \
-            -tp 80 \
-            -tl 250 \
-            -tlr 0.2 \
-            -dn 20 \
-            -dt 10 \
-            -sl 0.5 \
-            -p 0 \
+          CFST_ARGS=(
+            -httping
+            -httping-code 200
+            -url "${CFST_URL}"
+            -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA
+            -n 20
+            -t 4
+            -tp 443
+            -tl 250
+            -tlr 0.2
+            -dn 20
+            -dt 5
+            -sl 0.5
+            -p 0
             -o "$RESULT_CSV"
+          )
 
-          echo "Checking result file: $RESULT_CSV"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.debug_mode }}" = "true" ]; then
+            CFST_ARGS+=( -debug )
+          fi
+
+          ./cfst "${CFST_ARGS[@]}"
 
           if [ ! -s "$RESULT_CSV" ]; then
-            echo "Primary run did not produce a non-empty result.csv, rerunning once with -debug for diagnosis..."
-
-            ./cfst \
-              -httping \
-              -httping-code 200 \
-              -url "${CFST_URL}" \
-              -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
-              -n 10 \
-              -t 4 \
-              -tp 80 \
-              -tl 250 \
-              -tlr 0.2 \
-              -dn 10 \
-              -dt 10 \
-              -sl 0.5 \
-              -p 0 \
-              -debug \
-              -o "$DEBUG_CSV" || true
-
-            echo "Current directory files:"
-            ls -lah
-
-            echo "Find csv files:"
-            find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -name "*.csv" -print
-
-            if [ -f "$DEBUG_CSV" ]; then
-              echo "Preview debug-result.csv:"
-              head -n 20 "$DEBUG_CSV" || true
-            fi
-
-            echo "CFST did not generate a usable result.csv"
+            echo "CloudflareSpeedTest did not generate a non-empty result.csv" >&2
             exit 1
           fi
 
@@ -101,6 +119,8 @@ jobs:
           head -n 20 "$RESULT_CSV"
 
       - name: Build us.txt for cfnew
+        if: ${{ steps.fuse.outputs.skip != 'true' }}
+        shell: bash
         run: |
           python - <<'PY'
           import csv
@@ -108,7 +128,6 @@ jobs:
           import sys
 
           result_csv = pathlib.Path("result.csv")
-
           if not result_csv.is_file():
               print("result.csv not found", file=sys.stderr)
               sys.exit(1)
@@ -176,12 +195,55 @@ jobs:
           )
           PY
 
-      - name: Commit and push
+      - name: Commit success state and push
+        if: ${{ success() && steps.fuse.outputs.skip != 'true' }}
+        shell: bash
         run: |
           set -euo pipefail
+
+          mkdir -p "$(dirname "$FAILCOUNT_FILE")"
+          echo 0 > "$FAILCOUNT_FILE"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add us.txt us-meta.txt
-          git diff --cached --quiet && exit 0
+          git add us.txt us-meta.txt "$FAILCOUNT_FILE"
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
           git commit -m "update us.txt"
+          git push
+
+      - name: Record failure count
+        if: ${{ failure() && steps.fuse.outputs.skip != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$FAILCOUNT_FILE")"
+
+          current=0
+          if [ -f "$FAILCOUNT_FILE" ]; then
+            current="$(tr -d '[:space:]' < "$FAILCOUNT_FILE")"
+          fi
+          if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+            current=0
+          fi
+
+          max="$MAX_CONSECUTIVE_FAILURES"
+          if [ "$current" -lt "$max" ]; then
+            current=$((current + 1))
+          fi
+          echo "$current" > "$FAILCOUNT_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FAILCOUNT_FILE"
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit -m "chore: update CFST failure count to $current"
           git push
