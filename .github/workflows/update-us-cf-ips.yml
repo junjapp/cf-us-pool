@@ -12,22 +12,37 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CFST_VERSION: v2.3.4
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download CloudflareSpeedTest
         run: |
-          curl -L -o cfst.tar.gz https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            -o cfst.tar.gz \
+            "https://github.com/XIU2/CloudflareSpeedTest/releases/download/${CFST_VERSION}/cfst_linux_amd64.tar.gz"
           tar -zxf cfst.tar.gz
           chmod +x cfst
 
       - name: Run CloudflareSpeedTest for US POPs
         run: |
+          set -euo pipefail
+
+          RESULT_CSV="${GITHUB_WORKSPACE}/result.csv"
+          DEBUG_CSV="${GITHUB_WORKSPACE}/debug-result.csv"
+
+          rm -f "$RESULT_CSV" "$DEBUG_CSV"
+
           ./cfst \
             -httping \
             -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
@@ -40,24 +55,46 @@ jobs:
             -dt 8 \
             -sl 0.5 \
             -p 0 \
-            -o result.csv
+            -o "$RESULT_CSV"
 
-      - name: Debug cfst output
-        run: |
           echo "PWD=$(pwd)"
-          echo "Listing current directory:"
-          ls -lah
-          echo
-          echo "Find result.csv:"
-          find . -maxdepth 3 -name "result.csv" -print
-          echo
-          if [ -f result.csv ]; then
-            echo "result.csv exists in current directory"
-            echo "Preview result.csv:"
-            head -n 20 result.csv
-          else
-            echo "result.csv NOT found in current directory"
+          echo "Checking result file: $RESULT_CSV"
+
+          if [ ! -s "$RESULT_CSV" ]; then
+            echo "Primary run did not produce a non-empty result.csv, rerunning once with -debug for diagnosis..."
+
+            ./cfst \
+              -httping \
+              -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
+              -n 60 \
+              -t 4 \
+              -tp 443 \
+              -tl 250 \
+              -tlr 0.2 \
+              -dn 20 \
+              -dt 8 \
+              -sl 0.5 \
+              -p 0 \
+              -debug \
+              -o "$DEBUG_CSV" || true
+
+            echo "Current directory files:"
+            ls -lah
+
+            echo "Find csv files:"
+            find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -name "*.csv" -print
+
+            if [ -f "$DEBUG_CSV" ]; then
+              echo "Preview debug-result.csv:"
+              head -n 20 "$DEBUG_CSV" || true
+            fi
+
+            echo "CFST did not generate result.csv"
+            exit 1
           fi
+
+          echo "Preview result.csv:"
+          head -n 20 "$RESULT_CSV"
 
       - name: Build us.txt for cfnew
         run: |
@@ -66,26 +103,52 @@ jobs:
           import pathlib
           import sys
 
+          result_csv = pathlib.Path("result.csv")
+
+          if not result_csv.is_file():
+              print("result.csv not found", file=sys.stderr)
+              sys.exit(1)
+
           allowed = {
               "LAX", "SJC", "SEA", "LAS", "PHX", "DEN",
               "DFW", "ORD", "ATL", "IAD", "EWR", "JFK",
               "BOS", "MIA"
           }
 
+          def first_nonempty(row, keys):
+              for key in keys:
+                  value = (row.get(key) or "").strip()
+                  if value:
+                      return value
+              return ""
+
           rows = []
           seen = set()
 
-          with open("result.csv", encoding="utf-8-sig") as f:
+          with result_csv.open(encoding="utf-8-sig", newline="") as f:
               reader = csv.DictReader(f)
               for row in reader:
-                  ip = (row.get("IP 地址") or row.get("IP地址") or "").strip()
-                  colo = (row.get("地区码") or "").strip().upper()
+                  ip = first_nonempty(row, ["IP 地址", "IP地址", "IP"])
+                  colo = first_nonempty(row, ["地区码"]).upper()
+                  speed_text = first_nonempty(row, ["下载速度(MB/s)", "下载速度"])
+
                   if not ip or not colo or colo not in allowed:
                       continue
+
+                  try:
+                      speed = float(speed_text)
+                  except ValueError:
+                      continue
+
+                  # 与 CFST 主流程里的 -sl 0.5 保持一致，避免调试/异常输出混入低速结果
+                  if speed < 0.5:
+                      continue
+
                   if ip in seen:
                       continue
+
                   seen.add(ip)
-                  rows.append((ip, colo))
+                  rows.append((ip, colo, speed))
 
           if len(rows) < 5:
               print(f"Too few usable US IPs: {len(rows)}", file=sys.stderr)
@@ -95,7 +158,7 @@ jobs:
           out.write_text(
               "\n".join(
                   f"{ip}:443#US-{colo}-{i:02d}"
-                  for i, (ip, colo) in enumerate(rows[:20], 1)
+                  for i, (ip, colo, _speed) in enumerate(rows[:20], 1)
               ) + "\n",
               encoding="utf-8"
           )
@@ -104,7 +167,7 @@ jobs:
           meta.write_text(
               "\n".join([
                   f"count={min(len(rows), 20)}",
-                  f"sample={','.join(colo for _, colo in rows[:10])}"
+                  f"sample={','.join(colo for _, colo, _ in rows[:10])}"
               ]) + "\n",
               encoding="utf-8"
           )
@@ -112,6 +175,7 @@ jobs:
 
       - name: Commit and push
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add us.txt us-meta.txt
