@@ -42,6 +42,23 @@ jobs:
             -p 0 \
             -o result.csv
 
+      - name: Debug cfst output
+        run: |
+          echo "PWD=$(pwd)"
+          echo "Listing current directory:"
+          ls -lah
+          echo
+          echo "Find result.csv:"
+          find . -maxdepth 3 -name "result.csv" -print
+          echo
+          if [ -f result.csv ]; then
+            echo "result.csv exists in current directory"
+            echo "Preview result.csv:"
+            head -n 20 result.csv
+          else
+            echo "result.csv NOT found in current directory"
+          fi
+
       - name: Build us.txt for cfnew
         run: |
           python - <<'PY'
