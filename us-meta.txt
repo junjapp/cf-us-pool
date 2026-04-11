@@ -1,2 +1,2 @@
-count=20
-sample=ORD,ORD,ORD,ORD,ORD,ORD,ORD,ORD,ORD,ORD
+count=5
+sample=DFW,ORD,ORD,ORD,ORD
