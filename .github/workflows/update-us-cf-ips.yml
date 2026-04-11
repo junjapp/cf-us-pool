@@ -15,6 +15,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CFST_VERSION: v2.3.4
+  CFST_URL: http://speed.cloudflare.com/__down?bytes=209715200
 
 jobs:
   build:
@@ -45,19 +46,20 @@ jobs:
 
           ./cfst \
             -httping \
+            -httping-code 200 \
+            -url "${CFST_URL}" \
             -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
-            -n 60 \
+            -n 20 \
             -t 4 \
-            -tp 443 \
+            -tp 80 \
             -tl 250 \
             -tlr 0.2 \
             -dn 20 \
-            -dt 8 \
+            -dt 10 \
             -sl 0.5 \
             -p 0 \
             -o "$RESULT_CSV"
 
-          echo "PWD=$(pwd)"
           echo "Checking result file: $RESULT_CSV"
 
           if [ ! -s "$RESULT_CSV" ]; then
@@ -65,14 +67,16 @@ jobs:
 
             ./cfst \
               -httping \
+              -httping-code 200 \
+              -url "${CFST_URL}" \
               -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
-              -n 60 \
+              -n 10 \
               -t 4 \
-              -tp 443 \
+              -tp 80 \
               -tl 250 \
               -tlr 0.2 \
-              -dn 20 \
-              -dt 8 \
+              -dn 10 \
+              -dt 10 \
               -sl 0.5 \
               -p 0 \
               -debug \
@@ -89,7 +93,7 @@ jobs:
               head -n 20 "$DEBUG_CSV" || true
             fi
 
-            echo "CFST did not generate result.csv"
+            echo "CFST did not generate a usable result.csv"
             exit 1
           fi
 
@@ -140,7 +144,6 @@ jobs:
                   except ValueError:
                       continue
 
-                  # 与 CFST 主流程里的 -sl 0.5 保持一致，避免调试/异常输出混入低速结果
                   if speed < 0.5:
                       continue
 
