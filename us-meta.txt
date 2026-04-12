@@ -1,2 +1,4 @@
-count=5
-sample=DFW,ORD,ORD,ORD,ORD
+updated_at_utc=2026-04-12T07:54:27Z
+shard=1
+fresh_count=92
+final_count=92
