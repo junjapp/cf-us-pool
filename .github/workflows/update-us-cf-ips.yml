@@ -24,6 +24,7 @@ env:
   FAILCOUNT_FILE: .github/state/update-us-cf-ips.failcount
   MAX_CONSECUTIVE_FAILURES: "2"
   TARGET_POOL_SIZE: "20"
+  CFST_TIMEOUT_SECONDS: "420"
 
 jobs:
   build:
@@ -81,7 +82,7 @@ jobs:
           tar -zxf cfst.tar.gz
           chmod +x cfst
 
-      - name: Run CloudflareSpeedTest for US POPs (latency only)
+      - name: Run CloudflareSpeedTest for US POPs
         if: ${{ steps.fuse.outputs.skip != 'true' }}
         shell: bash
         run: |
@@ -91,8 +92,10 @@ jobs:
           rm -f "$RESULT_CSV"
 
           CFST_ARGS=(
+            -httping
+            -url https://www.cloudflare.com/cdn-cgi/trace
             -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA
-            -n 10
+            -n 4
             -t 4
             -tp 443
             -tl 250
@@ -106,7 +109,7 @@ jobs:
             CFST_ARGS+=( -debug )
           fi
 
-          ./cfst "${CFST_ARGS[@]}"
+          timeout "${CFST_TIMEOUT_SECONDS}s" ./cfst "${CFST_ARGS[@]}"
 
           if [ ! -s "$RESULT_CSV" ]; then
             echo "CloudflareSpeedTest did not generate a non-empty result.csv" >&2
