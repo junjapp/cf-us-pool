@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 3 1,8,15,22 * *"
 
 concurrency:
   group: update-us-cf-ips
@@ -21,7 +21,6 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CFST_VERSION: v2.3.4
-  CFST_URL: https://speed.cloudflare.com/__down?bytes=300000000
   FAILCOUNT_FILE: .github/state/update-us-cf-ips.failcount
   MAX_CONSECUTIVE_FAILURES: "2"
   TARGET_POOL_SIZE: "20"
@@ -29,7 +28,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -42,6 +41,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p "$(dirname "$FAILCOUNT_FILE")"
+
           if [ ! -f "$FAILCOUNT_FILE" ]; then
             echo 0 > "$FAILCOUNT_FILE"
           fi
@@ -55,14 +55,16 @@ jobs:
 
           if [ "${{ github.event_name }}" = "schedule" ] && [ "$count" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Scheduled runs paused after $count consecutive failures. Use workflow_dispatch after fixing the config."
+            echo "Scheduled runs paused after $count consecutive failures."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Stop scheduled runs after repeated failures
         if: ${{ steps.fuse.outputs.skip == 'true' }}
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Skipping scheduled run because the consecutive failure threshold was reached."
           exit 0
 
@@ -79,7 +81,7 @@ jobs:
           tar -zxf cfst.tar.gz
           chmod +x cfst
 
-      - name: Run CloudflareSpeedTest for US POPs
+      - name: Run CloudflareSpeedTest for US POPs (latency only)
         if: ${{ steps.fuse.outputs.skip != 'true' }}
         shell: bash
         run: |
@@ -89,18 +91,13 @@ jobs:
           rm -f "$RESULT_CSV"
 
           CFST_ARGS=(
-            -httping
-            -httping-code 200
-            -url "${CFST_URL}"
             -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA
             -n 10
             -t 4
             -tp 443
             -tl 250
             -tlr 0.2
-            -dn 20
-            -dt 10
-            -sl 0.5
+            -dd
             -p 0
             -o "$RESULT_CSV"
           )
@@ -119,7 +116,7 @@ jobs:
           echo "Preview result.csv:"
           head -n 20 "$RESULT_CSV"
 
-      - name: Build us.txt for cfnew
+      - name: Build us.txt for Clash subscription
         if: ${{ steps.fuse.outputs.skip != 'true' }}
         shell: bash
         run: |
@@ -157,24 +154,23 @@ jobs:
               for row in reader:
                   ip = first_nonempty(row, ["IP 地址", "IP地址", "IP"])
                   colo = first_nonempty(row, ["地区码"]).upper()
-                  speed_text = first_nonempty(row, ["下载速度(MB/s)", "下载速度"])
+                  latency_text = first_nonempty(row, ["平均延迟", "平均延迟(ms)", "延迟"])
 
                   if not ip or not colo or colo not in allowed:
                       continue
 
                   try:
-                      speed = float(speed_text)
+                      latency = float(latency_text)
                   except ValueError:
-                      continue
-
-                  if speed < 0.5:
                       continue
 
                   if ip in seen:
                       continue
 
                   seen.add(ip)
-                  rows.append((ip, colo, speed))
+                  rows.append((ip, colo, latency))
+
+          rows.sort(key=lambda x: x[2])
 
           if len(rows) < target_pool_size:
               print(
@@ -185,20 +181,19 @@ jobs:
 
           rows = rows[:target_pool_size]
 
-          out = pathlib.Path("us.txt")
-          out.write_text(
+          pathlib.Path("us.txt").write_text(
               "\n".join(
                   f"{ip}:443#US-{colo}-{i:02d}"
-                  for i, (ip, colo, _speed) in enumerate(rows, 1)
+                  for i, (ip, colo, _latency) in enumerate(rows, 1)
               ) + "\n",
               encoding="utf-8"
           )
 
-          meta = pathlib.Path("us-meta.txt")
-          meta.write_text(
+          pathlib.Path("us-meta.txt").write_text(
               "\n".join([
                   f"count={len(rows)}",
-                  f"sample={','.join(colo for _, colo, _ in rows[:10])}"
+                  f"sample={','.join(colo for _, colo, _ in rows[:10])}",
+                  f"avg_latency_top5={','.join(f'{lat:.2f}' for _, _, lat in rows[:5])}"
               ]) + "\n",
               encoding="utf-8"
           )
