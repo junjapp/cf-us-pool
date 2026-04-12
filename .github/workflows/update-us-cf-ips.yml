@@ -2,255 +2,225 @@ name: Update US Cloudflare IPs
 
 on:
   workflow_dispatch:
-    inputs:
-      debug_mode:
-        description: "Manual debug run for CloudflareSpeedTest"
-        required: false
-        default: false
-        type: boolean
   schedule:
+    # GitHub Actions cron 默认按 UTC 运行
     - cron: "17 3 1,8,15,22 * *"
-
-concurrency:
-  group: update-us-cf-ips
-  cancel-in-progress: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: cf-us-pool-update
+  cancel-in-progress: false
+
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  CFST_VERSION: v2.3.4
-  FAILCOUNT_FILE: .github/state/update-us-cf-ips.failcount
-  MAX_CONSECUTIVE_FAILURES: "2"
-  TARGET_POOL_SIZE: "20"
-  CFST_TIMEOUT_SECONDS: "420"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CFST_VERSION: "2.3.4"
+  TARGET_COUNT: "200"
+  SHARD_COUNT: "4"
+  SHARD_KEEP: "80"
+  MIN_FRESH_IPS: "30"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Read failure fuse
-        id: fuse
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$(dirname "$FAILCOUNT_FILE")"
-
-          if [ ! -f "$FAILCOUNT_FILE" ]; then
-            echo 0 > "$FAILCOUNT_FILE"
-          fi
-
-          count="$(tr -d '[:space:]' < "$FAILCOUNT_FILE")"
-          if ! [[ "$count" =~ ^[0-9]+$ ]]; then
-            count=0
-          fi
-
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "$count" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Scheduled runs paused after $count consecutive failures."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Stop scheduled runs after repeated failures
-        if: ${{ steps.fuse.outputs.skip == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Skipping scheduled run because the consecutive failure threshold was reached."
-          exit 0
-
       - name: Download CloudflareSpeedTest
-        if: ${{ steps.fuse.outputs.skip != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-
-          curl -fL --retry 3 --retry-delay 2 \
-            -o cfst.tar.gz \
-            "https://github.com/XIU2/CloudflareSpeedTest/releases/download/${CFST_VERSION}/cfst_linux_amd64.tar.gz"
-
+          curl -L -o cfst.tar.gz \
+            "https://github.com/XIU2/CloudflareSpeedTest/releases/download/v${CFST_VERSION}/cfst_linux_amd64.tar.gz"
           tar -zxf cfst.tar.gz
           chmod +x cfst
 
-      - name: Run CloudflareSpeedTest for US POPs
-        if: ${{ steps.fuse.outputs.skip != 'true' }}
+      - name: Prepare shard for this scheduled run
+        id: shard
         shell: bash
         run: |
           set -euo pipefail
 
-          RESULT_CSV="${GITHUB_WORKSPACE}/result.csv"
-          rm -f "$RESULT_CSV"
-
-          CFST_ARGS=(
-            -httping
-            -url https://www.cloudflare.com/cdn-cgi/trace
-            -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA
-            -n 4
-            -t 4
-            -tp 443
-            -tl 250
-            -tlr 0.2
-            -dd
-            -p 0
-            -o "$RESULT_CSV"
-          )
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.debug_mode }}" = "true" ]; then
-            CFST_ARGS+=( -debug )
+          day="$(date -u +%d | sed 's/^0//')"
+          if [ "$day" -ge 22 ]; then
+            shard=3
+          elif [ "$day" -ge 15 ]; then
+            shard=2
+          elif [ "$day" -ge 8 ]; then
+            shard=1
+          else
+            shard=0
           fi
 
-          timeout "${CFST_TIMEOUT_SECONDS}s" ./cfst "${CFST_ARGS[@]}"
+          mkdir -p data tmp
 
-          if [ ! -s "$RESULT_CSV" ]; then
-            echo "CloudflareSpeedTest did not generate a non-empty result.csv" >&2
-            exit 1
-          fi
+          awk -v shard="$shard" -v total="$SHARD_COUNT" '
+            NF > 0 && $0 !~ /^#/ {
+              if ((count % total) == shard) print
+              count++
+            }
+          ' ip.txt > tmp/ip-shard.txt
 
-          echo "Preview result.csv:"
-          head -n 20 "$RESULT_CSV"
+          lines="$(wc -l < tmp/ip-shard.txt | tr -d ' ')"
+          echo "shard=$shard" >> "$GITHUB_OUTPUT"
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
 
-      - name: Build us.txt for Clash subscription
-        if: ${{ steps.fuse.outputs.skip != 'true' }}
+          echo "Using shard: $shard"
+          echo "Shard candidate ranges: $lines"
+
+      - name: Run CloudflareSpeedTest for this US shard
+        timeout-minutes: 18
         shell: bash
         run: |
+          set -euo pipefail
+          ./cfst \
+            -httping \
+            -dd \
+            -httping-code 200 \
+            -url https://www.cloudflare.com/cdn-cgi/trace \
+            -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
+            -f tmp/ip-shard.txt \
+            -n 24 \
+            -t 2 \
+            -tp 443 \
+            -tl 250 \
+            -tlr 0.2 \
+            -p 0 \
+            -o tmp/result.csv
+
+      - name: Build fresh shard snapshot and merged us.txt
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
           import csv
+          import datetime as dt
+          import ipaddress
           import os
-          import pathlib
-          import sys
+          from pathlib import Path
 
-          result_csv = pathlib.Path("result.csv")
-          if not result_csv.is_file():
-              print("result.csv not found", file=sys.stderr)
-              sys.exit(1)
+          target_count = int(os.environ["TARGET_COUNT"])
+          shard_keep = int(os.environ["SHARD_KEEP"])
+          min_fresh_ips = int(os.environ["MIN_FRESH_IPS"])
+          shard = int("${{ steps.shard.outputs.shard }}")
 
-          target_pool_size = int(os.environ["TARGET_POOL_SIZE"])
+          result_path = Path("tmp/result.csv")
+          if not result_path.exists() or result_path.stat().st_size == 0:
+              raise SystemExit("tmp/result.csv not found or empty")
 
-          allowed = {
-              "LAX", "SJC", "SEA", "LAS", "PHX", "DEN",
-              "DFW", "ORD", "ATL", "IAD", "EWR", "JFK",
-              "BOS", "MIA"
-          }
+          data_dir = Path("data")
+          data_dir.mkdir(exist_ok=True)
 
-          def first_nonempty(row, keys):
-              for key in keys:
-                  value = (row.get(key) or "").strip()
-                  if value:
-                      return value
-              return ""
+          def is_ip(value: str) -> bool:
+              try:
+                  ipaddress.ip_address(value.strip())
+                  return True
+              except ValueError:
+                  return False
 
-          rows = []
-          seen = set()
-
-          with result_csv.open(encoding="utf-8-sig", newline="") as f:
-              reader = csv.DictReader(f)
-              for row in reader:
-                  ip = first_nonempty(row, ["IP 地址", "IP地址", "IP"])
-                  colo = first_nonempty(row, ["地区码"]).upper()
-                  latency_text = first_nonempty(row, ["平均延迟", "平均延迟(ms)", "延迟"])
-
-                  if not ip or not colo or colo not in allowed:
-                      continue
-
+          def parse_delay(row):
+              if len(row) >= 5:
                   try:
-                      latency = float(latency_text)
-                  except ValueError:
+                      return float(row[4])
+                  except Exception:
+                      pass
+              for cell in row[1:]:
+                  try:
+                      return float(cell)
+                  except Exception:
                       continue
+              return 999999.0
 
-                  if ip in seen:
+          fresh_rows = []
+          with result_path.open("r", encoding="utf-8-sig", newline="") as f:
+              reader = csv.reader(f)
+              for row in reader:
+                  if not row:
                       continue
+                  ip = row[0].strip()
+                  if not is_ip(ip):
+                      continue
+                  delay = parse_delay(row)
+                  colo = row[-1].strip() if len(row) >= 2 else ""
+                  fresh_rows.append((ip, delay, colo))
 
-                  seen.add(ip)
-                  rows.append((ip, colo, latency))
+          if len(fresh_rows) < min_fresh_ips:
+              raise SystemExit(f"fresh shard results too small: {len(fresh_rows)} < {min_fresh_ips}")
 
-          rows.sort(key=lambda x: x[2])
+          shard_csv = data_dir / f"us-shard-{shard}.csv"
+          with shard_csv.open("w", encoding="utf-8", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["ip", "delay_ms", "colo"])
+              for ip, delay, colo in fresh_rows[:shard_keep]:
+                  writer.writerow([ip, f"{delay:.2f}", colo])
 
-          if len(rows) < target_pool_size:
-              print(
-                  f"Too few usable US IPs: {len(rows)} / required {target_pool_size}",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
+          merged = []
+          for p in sorted(data_dir.glob("us-shard-*.csv")):
+              with p.open("r", encoding="utf-8", newline="") as f:
+                  reader = csv.DictReader(f)
+                  for row in reader:
+                      ip = row.get("ip", "").strip()
+                      if not is_ip(ip):
+                          continue
+                      try:
+                          delay = float(row.get("delay_ms", "999999"))
+                      except Exception:
+                          delay = 999999.0
+                      colo = row.get("colo", "").strip()
+                      merged.append((ip, delay, colo))
 
-          rows = rows[:target_pool_size]
+          merged.sort(key=lambda x: (x[1], x[0]))
 
-          pathlib.Path("us.txt").write_text(
-              "\n".join(
-                  f"{ip}:443#US-{colo}-{i:02d}"
-                  for i, (ip, colo, _latency) in enumerate(rows, 1)
-              ) + "\n",
-              encoding="utf-8"
-          )
+          seen = set()
+          final_ips = []
+          for ip, delay, colo in merged:
+              if ip in seen:
+                  continue
+              seen.add(ip)
+              final_ips.append((ip, delay, colo))
+              if len(final_ips) >= target_count:
+                  break
 
-          pathlib.Path("us-meta.txt").write_text(
-              "\n".join([
-                  f"count={len(rows)}",
-                  f"sample={','.join(colo for _, colo, _ in rows[:10])}",
-                  f"avg_latency_top5={','.join(f'{lat:.2f}' for _, _, lat in rows[:5])}"
-              ]) + "\n",
-              encoding="utf-8"
-          )
+          if len(final_ips) < min_fresh_ips:
+              raise SystemExit(f"merged final pool too small: {len(final_ips)} < {min_fresh_ips}")
+
+          with Path("us.txt").open("w", encoding="utf-8", newline="") as f:
+              for ip, _, _ in final_ips:
+                  f.write(ip + "\\n")
+
+          today = dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+          with Path("us-meta.txt").open("w", encoding="utf-8", newline="") as f:
+              f.write(f"updated_at_utc={today}\\n")
+              f.write(f"shard={shard}\\n")
+              f.write(f"fresh_count={len(fresh_rows)}\\n")
+              f.write(f"final_count={len(final_ips)}\\n")
+
+          print(f"fresh_count={len(fresh_rows)}")
+          print(f"final_count={len(final_ips)}")
           PY
 
-      - name: Commit success state and push
-        if: ${{ success() && steps.fuse.outputs.skip != 'true' }}
+      - name: Fail when us.txt is too small
         shell: bash
         run: |
           set -euo pipefail
+          count="$(grep -c '.' us.txt || true)"
+          echo "Final us.txt lines: $count"
+          test "$count" -ge "$MIN_FRESH_IPS"
 
-          mkdir -p "$(dirname "$FAILCOUNT_FILE")"
-          echo 0 > "$FAILCOUNT_FILE"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add us.txt us-meta.txt "$FAILCOUNT_FILE"
-
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-
-          git commit -m "update us.txt"
-          git push
-
-      - name: Record failure count for scheduled runs
-        if: ${{ failure() && steps.fuse.outputs.skip != 'true' && github.event_name == 'schedule' }}
+      - name: Commit and push if changed
         shell: bash
         run: |
           set -euo pipefail
-
-          mkdir -p "$(dirname "$FAILCOUNT_FILE")"
-
-          current=0
-          if [ -f "$FAILCOUNT_FILE" ]; then
-            current="$(tr -d '[:space:]' < "$FAILCOUNT_FILE")"
-          fi
-          if ! [[ "$current" =~ ^[0-9]+$ ]]; then
-            current=0
-          fi
-
-          max="$MAX_CONSECUTIVE_FAILURES"
-          if [ "$current" -lt "$max" ]; then
-            current=$((current + 1))
-          fi
-          echo "$current" > "$FAILCOUNT_FILE"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$FAILCOUNT_FILE"
-
+          git add us.txt us-meta.txt data/us-shard-*.csv
           if git diff --cached --quiet; then
+            echo "No changes to commit"
             exit 0
           fi
-
-          git commit -m "chore: update CFST failure count to $current"
+          git commit -m "chore: refresh US Cloudflare IP pool"
           git push
