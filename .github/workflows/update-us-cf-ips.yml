@@ -3,7 +3,6 @@ name: Update US Cloudflare IPs
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions cron 默认按 UTC 运行
     - cron: "17 3 1,8,15,22 * *"
 
 permissions:
@@ -18,13 +17,15 @@ env:
   CFST_VERSION: "2.3.4"
   TARGET_COUNT: "200"
   SHARD_COUNT: "4"
-  SHARD_KEEP: "80"
-  MIN_FRESH_IPS: "30"
+  SHARD_KEEP: "120"
+  MIN_FINAL_IPS: "30"
+  CFST_THREADS: "8"
+  CFST_TRIES: "1"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -66,29 +67,29 @@ jobs:
           ' ip.txt > tmp/ip-shard.txt
 
           lines="$(wc -l < tmp/ip-shard.txt | tr -d ' ')"
+          if [ "$lines" -eq 0 ]; then
+            echo "tmp/ip-shard.txt is empty" >&2
+            exit 1
+          fi
+
           echo "shard=$shard" >> "$GITHUB_OUTPUT"
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
-
           echo "Using shard: $shard"
-          echo "Shard candidate ranges: $lines"
+          echo "Shard input lines: $lines"
 
       - name: Run CloudflareSpeedTest for this US shard
-        timeout-minutes: 18
+        timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail
           ./cfst \
             -httping \
             -dd \
-            -httping-code 200 \
-            -url https://www.cloudflare.com/cdn-cgi/trace \
             -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA \
             -f tmp/ip-shard.txt \
-            -n 24 \
-            -t 2 \
+            -n "$CFST_THREADS" \
+            -t "$CFST_TRIES" \
             -tp 443 \
-            -tl 250 \
-            -tlr 0.2 \
             -p 0 \
             -o tmp/result.csv
 
@@ -105,8 +106,12 @@ jobs:
 
           target_count = int(os.environ["TARGET_COUNT"])
           shard_keep = int(os.environ["SHARD_KEEP"])
-          min_fresh_ips = int(os.environ["MIN_FRESH_IPS"])
+          min_final_ips = int(os.environ["MIN_FINAL_IPS"])
           shard = int("${{ steps.shard.outputs.shard }}")
+          allowed_colos = {
+              "LAX", "SJC", "SEA", "LAS", "PHX", "DEN", "DFW",
+              "ORD", "ATL", "IAD", "EWR", "JFK", "BOS", "MIA"
+          }
 
           result_path = Path("tmp/result.csv")
           if not result_path.exists() or result_path.stat().st_size == 0:
@@ -122,18 +127,11 @@ jobs:
               except ValueError:
                   return False
 
-          def parse_delay(row):
-              if len(row) >= 5:
-                  try:
-                      return float(row[4])
-                  except Exception:
-                      pass
-              for cell in row[1:]:
-                  try:
-                      return float(cell)
-                  except Exception:
-                      continue
-              return 999999.0
+          def to_float(value: str, default: float) -> float:
+              try:
+                  return float(str(value).strip())
+              except Exception:
+                  return default
 
           fresh_rows = []
           with result_path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -144,19 +142,27 @@ jobs:
                   ip = row[0].strip()
                   if not is_ip(ip):
                       continue
-                  delay = parse_delay(row)
-                  colo = row[-1].strip() if len(row) >= 2 else ""
-                  fresh_rows.append((ip, delay, colo))
+                  sent = to_float(row[1] if len(row) > 1 else "0", 0.0)
+                  recv = to_float(row[2] if len(row) > 2 else "0", 0.0)
+                  loss = to_float(row[3] if len(row) > 3 else "1", 1.0)
+                  delay = to_float(row[4] if len(row) > 4 else "999999", 999999.0)
+                  colo = (row[6] if len(row) > 6 else row[-1]).strip().upper()
+                  if colo not in allowed_colos:
+                      continue
+                  fresh_rows.append((ip, sent, recv, loss, delay, colo))
 
-          if len(fresh_rows) < min_fresh_ips:
-              raise SystemExit(f"fresh shard results too small: {len(fresh_rows)} < {min_fresh_ips}")
+          if not fresh_rows:
+              raise SystemExit("fresh shard results empty after parsing")
+
+          fresh_rows.sort(key=lambda x: (x[4], x[3], x[0]))
 
           shard_csv = data_dir / f"us-shard-{shard}.csv"
           with shard_csv.open("w", encoding="utf-8", newline="") as f:
               writer = csv.writer(f)
-              writer.writerow(["ip", "delay_ms", "colo"])
-              for ip, delay, colo in fresh_rows[:shard_keep]:
-                  writer.writerow([ip, f"{delay:.2f}", colo])
+              writer.writerow(["ip", "sent", "recv", "loss", "delay_ms", "colo", "updated_at_utc"])
+              updated_at = dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+              for ip, sent, recv, loss, delay, colo in fresh_rows[:shard_keep]:
+                  writer.writerow([ip, int(sent), int(recv), f"{loss:.2f}", f"{delay:.2f}", colo, updated_at])
 
           merged = []
           for p in sorted(data_dir.glob("us-shard-*.csv")):
@@ -166,50 +172,49 @@ jobs:
                       ip = row.get("ip", "").strip()
                       if not is_ip(ip):
                           continue
-                      try:
-                          delay = float(row.get("delay_ms", "999999"))
-                      except Exception:
-                          delay = 999999.0
-                      colo = row.get("colo", "").strip()
-                      merged.append((ip, delay, colo))
+                      colo = row.get("colo", "").strip().upper()
+                      if colo not in allowed_colos:
+                          continue
+                      loss = to_float(row.get("loss", "1"), 1.0)
+                      delay = to_float(row.get("delay_ms", "999999"), 999999.0)
+                      merged.append((ip, loss, delay, colo))
 
-          merged.sort(key=lambda x: (x[1], x[0]))
+          merged.sort(key=lambda x: (x[2], x[1], x[0]))
 
           seen = set()
           final_ips = []
-          for ip, delay, colo in merged:
+          for ip, loss, delay, colo in merged:
               if ip in seen:
                   continue
               seen.add(ip)
-              final_ips.append((ip, delay, colo))
+              final_ips.append((ip, loss, delay, colo))
               if len(final_ips) >= target_count:
                   break
 
-          if len(final_ips) < min_fresh_ips:
-              raise SystemExit(f"merged final pool too small: {len(final_ips)} < {min_fresh_ips}")
+          if len(final_ips) < min_final_ips:
+              raise SystemExit(f"merged final pool too small: {len(final_ips)} < {min_final_ips}")
 
           with Path("us.txt").open("w", encoding="utf-8", newline="") as f:
-              for ip, _, _ in final_ips:
-                  f.write(ip + "\\n")
+              for ip, _, _, _ in final_ips:
+                  f.write(ip + "\n")
 
-          today = dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
           with Path("us-meta.txt").open("w", encoding="utf-8", newline="") as f:
-              f.write(f"updated_at_utc={today}\\n")
-              f.write(f"shard={shard}\\n")
-              f.write(f"fresh_count={len(fresh_rows)}\\n")
-              f.write(f"final_count={len(final_ips)}\\n")
+              f.write(f"updated_at_utc={dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+              f.write(f"shard={shard}\n")
+              f.write(f"fresh_count={len(fresh_rows)}\n")
+              f.write(f"final_count={len(final_ips)}\n")
 
           print(f"fresh_count={len(fresh_rows)}")
           print(f"final_count={len(final_ips)}")
           PY
 
-      - name: Fail when us.txt is too small
+      - name: Validate us.txt
         shell: bash
         run: |
           set -euo pipefail
           count="$(grep -c '.' us.txt || true)"
           echo "Final us.txt lines: $count"
-          test "$count" -ge "$MIN_FRESH_IPS"
+          test "$count" -ge "$MIN_FINAL_IPS"
 
       - name: Commit and push if changed
         shell: bash
