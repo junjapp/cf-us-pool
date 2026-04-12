@@ -21,14 +21,15 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CFST_VERSION: v2.3.4
-  CFST_URL: https://speed.cloudflare.com/__down?bytes=99999999
+  CFST_URL: https://speed.cloudflare.com/__down?bytes=300000000
   FAILCOUNT_FILE: .github/state/update-us-cf-ips.failcount
-  MAX_CONSECUTIVE_FAILURES: "3"
+  MAX_CONSECUTIVE_FAILURES: "2"
+  TARGET_POOL_SIZE: "20"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -92,13 +93,13 @@ jobs:
             -httping-code 200
             -url "${CFST_URL}"
             -cfcolo LAX,SJC,SEA,LAS,PHX,DEN,DFW,ORD,ATL,IAD,EWR,JFK,BOS,MIA
-            -n 20
+            -n 10
             -t 4
             -tp 443
             -tl 250
             -tlr 0.2
             -dn 20
-            -dt 5
+            -dt 10
             -sl 0.5
             -p 0
             -o "$RESULT_CSV"
@@ -124,6 +125,7 @@ jobs:
         run: |
           python - <<'PY'
           import csv
+          import os
           import pathlib
           import sys
 
@@ -131,6 +133,8 @@ jobs:
           if not result_csv.is_file():
               print("result.csv not found", file=sys.stderr)
               sys.exit(1)
+
+          target_pool_size = int(os.environ["TARGET_POOL_SIZE"])
 
           allowed = {
               "LAX", "SJC", "SEA", "LAS", "PHX", "DEN",
@@ -172,15 +176,20 @@ jobs:
                   seen.add(ip)
                   rows.append((ip, colo, speed))
 
-          if len(rows) < 5:
-              print(f"Too few usable US IPs: {len(rows)}", file=sys.stderr)
+          if len(rows) < target_pool_size:
+              print(
+                  f"Too few usable US IPs: {len(rows)} / required {target_pool_size}",
+                  file=sys.stderr,
+              )
               sys.exit(1)
+
+          rows = rows[:target_pool_size]
 
           out = pathlib.Path("us.txt")
           out.write_text(
               "\n".join(
                   f"{ip}:443#US-{colo}-{i:02d}"
-                  for i, (ip, colo, _speed) in enumerate(rows[:20], 1)
+                  for i, (ip, colo, _speed) in enumerate(rows, 1)
               ) + "\n",
               encoding="utf-8"
           )
@@ -188,7 +197,7 @@ jobs:
           meta = pathlib.Path("us-meta.txt")
           meta.write_text(
               "\n".join([
-                  f"count={min(len(rows), 20)}",
+                  f"count={len(rows)}",
                   f"sample={','.join(colo for _, colo, _ in rows[:10])}"
               ]) + "\n",
               encoding="utf-8"
@@ -215,8 +224,8 @@ jobs:
           git commit -m "update us.txt"
           git push
 
-      - name: Record failure count
-        if: ${{ failure() && steps.fuse.outputs.skip != 'true' }}
+      - name: Record failure count for scheduled runs
+        if: ${{ failure() && steps.fuse.outputs.skip != 'true' && github.event_name == 'schedule' }}
         shell: bash
         run: |
           set -euo pipefail
