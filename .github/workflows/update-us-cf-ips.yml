@@ -16,6 +16,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   CFST_VERSION: "2.3.4"
   TARGET_COUNT: "200"
+  TOP_COUNT: "20"
   SHARD_COUNT: "4"
   SHARD_KEEP: "120"
   MIN_FINAL_IPS: "30"
@@ -93,7 +94,7 @@ jobs:
             -p 0 \
             -o tmp/result.csv
 
-      - name: Build fresh shard snapshot and merged us.txt
+      - name: Build merged pool and top20 subscription file
         shell: bash
         run: |
           set -euo pipefail
@@ -105,12 +106,31 @@ jobs:
           from pathlib import Path
 
           target_count = int(os.environ["TARGET_COUNT"])
+          top_count = int(os.environ["TOP_COUNT"])
           shard_keep = int(os.environ["SHARD_KEEP"])
           min_final_ips = int(os.environ["MIN_FINAL_IPS"])
           shard = int("${{ steps.shard.outputs.shard }}")
+
           allowed_colos = {
               "LAX", "SJC", "SEA", "LAS", "PHX", "DEN", "DFW",
               "ORD", "ATL", "IAD", "EWR", "JFK", "BOS", "MIA"
+          }
+
+          colo_city_map = {
+              "LAX": "洛杉矶",
+              "SJC": "圣何塞",
+              "SEA": "西雅图",
+              "LAS": "拉斯维加斯",
+              "PHX": "菲尼克斯",
+              "DEN": "丹佛",
+              "DFW": "达拉斯",
+              "ORD": "芝加哥",
+              "ATL": "亚特兰大",
+              "IAD": "华盛顿",
+              "EWR": "纽瓦克",
+              "JFK": "纽约",
+              "BOS": "波士顿",
+              "MIA": "迈阿密",
           }
 
           result_path = Path("tmp/result.csv")
@@ -156,11 +176,12 @@ jobs:
 
           fresh_rows.sort(key=lambda x: (x[4], x[3], x[0]))
 
+          updated_at = dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
           shard_csv = data_dir / f"us-shard-{shard}.csv"
           with shard_csv.open("w", encoding="utf-8", newline="") as f:
               writer = csv.writer(f)
               writer.writerow(["ip", "sent", "recv", "loss", "delay_ms", "colo", "updated_at_utc"])
-              updated_at = dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
               for ip, sent, recv, loss, delay, colo in fresh_rows[:shard_keep]:
                   writer.writerow([ip, int(sent), int(recv), f"{loss:.2f}", f"{delay:.2f}", colo, updated_at])
 
@@ -194,27 +215,58 @@ jobs:
           if len(final_ips) < min_final_ips:
               raise SystemExit(f"merged final pool too small: {len(final_ips)} < {min_final_ips}")
 
+          if len(final_ips) < top_count:
+              raise SystemExit(f"not enough IPs for top subset: {len(final_ips)} < {top_count}")
+
+          top_rows = final_ips[:top_count]
+
+          # 1) 完整美国优选池
           with Path("us.txt").open("w", encoding="utf-8", newline="") as f:
               for ip, _, _, _ in final_ips:
                   f.write(ip + "\n")
 
+          # 2) 给 cfnew 的 top20 文件
+          top_cfnew_items = []
+          for idx, (ip, loss, delay, colo) in enumerate(top_rows, start=1):
+              city = colo_city_map.get(colo, colo)
+              name = f"🇺🇸_美国-{city}-{colo}-{idx:02d}-443-WS-TLS"
+              top_cfnew_items.append(f"{ip}:443#{name}")
+
+          with Path("top20-us-cfnew.txt").open("w", encoding="utf-8", newline="") as f:
+              f.write(",".join(top_cfnew_items) + "\n")
+
           with Path("us-meta.txt").open("w", encoding="utf-8", newline="") as f:
-              f.write(f"updated_at_utc={dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+              f.write(f"updated_at_utc={updated_at}\n")
               f.write(f"shard={shard}\n")
               f.write(f"fresh_count={len(fresh_rows)}\n")
               f.write(f"final_count={len(final_ips)}\n")
+              f.write(f"top_count={len(top_rows)}\n")
 
           print(f"fresh_count={len(fresh_rows)}")
           print(f"final_count={len(final_ips)}")
+          print(f"top_count={len(top_rows)}")
           PY
 
-      - name: Validate us.txt
+      - name: Validate output files
         shell: bash
         run: |
           set -euo pipefail
-          count="$(grep -c '.' us.txt || true)"
-          echo "Final us.txt lines: $count"
-          test "$count" -ge "$MIN_FINAL_IPS"
+
+          final_count="$(grep -c '.' us.txt || true)"
+
+          top_cfnew_count="$(python - <<'PY'
+          from pathlib import Path
+          s = Path('top20-us-cfnew.txt').read_text(encoding='utf-8').strip()
+          items = [x for x in s.split(',') if x.strip()]
+          print(len(items))
+          PY
+          )"
+
+          echo "Final us.txt lines: $final_count"
+          echo "Top cfnew items: $top_cfnew_count"
+
+          test "$final_count" -ge "$MIN_FINAL_IPS"
+          test "$top_cfnew_count" -eq "$TOP_COUNT"
 
       - name: Commit and push if changed
         shell: bash
@@ -222,10 +274,10 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add us.txt us-meta.txt data/us-shard-*.csv
+          git add us.txt top20-us-cfnew.txt us-meta.txt data/us-shard-*.csv
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
-          git commit -m "chore: refresh US Cloudflare IP pool"
+          git commit -m "chore: refresh US Cloudflare IP pool and top20 subscription"
           git push
