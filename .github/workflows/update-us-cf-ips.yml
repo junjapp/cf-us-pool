@@ -220,12 +220,10 @@ jobs:
 
           top_rows = final_ips[:top_count]
 
-          # 1) 完整美国优选池
           with Path("us.txt").open("w", encoding="utf-8", newline="") as f:
               for ip, _, _, _ in final_ips:
                   f.write(ip + "\n")
 
-          # 2) 给 cfnew 的 top20 文件
           top_cfnew_items = []
           for idx, (ip, loss, delay, colo) in enumerate(top_rows, start=1):
               city = colo_city_map.get(colo, colo)
