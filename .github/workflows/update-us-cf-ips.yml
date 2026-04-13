@@ -220,18 +220,17 @@ jobs:
 
           top_rows = final_ips[:top_count]
 
+          # 完整池
           with Path("us.txt").open("w", encoding="utf-8", newline="") as f:
               for ip, _, _, _ in final_ips:
                   f.write(ip + "\n")
 
-          top_cfnew_items = []
-          for idx, (ip, loss, delay, colo) in enumerate(top_rows, start=1):
-              city = colo_city_map.get(colo, colo)
-              name = f"🇺🇸_美国-{city}-{colo}-{idx:02d}-443-WS-TLS"
-              top_cfnew_items.append(f"{ip}:443#{name}")
-
+          # 关键修复：yxURL 远程文件必须一行一个节点，不能逗号拼成一整行
           with Path("top20-us-cfnew.txt").open("w", encoding="utf-8", newline="") as f:
-              f.write(",".join(top_cfnew_items) + "\n")
+              for idx, (ip, loss, delay, colo) in enumerate(top_rows, start=1):
+                  city = colo_city_map.get(colo, colo)
+                  name = f"🇺🇸_美国-{city}-{colo}-{idx:02d}-443-WS-TLS"
+                  f.write(f"{ip}:443#{name}\n")
 
           with Path("us-meta.txt").open("w", encoding="utf-8", newline="") as f:
               f.write(f"updated_at_utc={updated_at}\n")
@@ -251,17 +250,10 @@ jobs:
           set -euo pipefail
 
           final_count="$(grep -c '.' us.txt || true)"
-
-          top_cfnew_count="$(python - <<'PY'
-          from pathlib import Path
-          s = Path('top20-us-cfnew.txt').read_text(encoding='utf-8').strip()
-          items = [x for x in s.split(',') if x.strip()]
-          print(len(items))
-          PY
-          )"
+          top_cfnew_count="$(grep -c '.' top20-us-cfnew.txt || true)"
 
           echo "Final us.txt lines: $final_count"
-          echo "Top cfnew items: $top_cfnew_count"
+          echo "Top cfnew lines: $top_cfnew_count"
 
           test "$final_count" -ge "$MIN_FINAL_IPS"
           test "$top_cfnew_count" -eq "$TOP_COUNT"
