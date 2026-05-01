@@ -1,5 +1,5 @@
-updated_at_utc=2026-04-22T05:45:09Z
-shard=3
-fresh_count=2097
+updated_at_utc=2026-05-01T06:24:33Z
+shard=0
+fresh_count=50
 final_count=200
 top_count=20
